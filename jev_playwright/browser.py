@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from .elements import Element, consent_button, content_text, page_text, parse_snapshot, prioritize
+from .elements import LOADING_RE, Element, consent_button, content_text, page_text, parse_snapshot, prioritize
 
 SNAP_RE = re.compile(r"```yaml\n(.*?)```", re.S)
 URL_RE = re.compile(r"- Page URL: (.*)")
@@ -46,6 +46,12 @@ class PageState:
         return bool(CHALLENGE_RE.search(self.snapshot)) and len(self.elements) < 12
 
     @property
+    def loading(self) -> int:
+        """Placeholders de carga no snapshot ("Os visuais estão carregando..."): painéis embutidos ainda
+        montando. Zero quando a página está pronta."""
+        return sum(1 for line in self.snapshot.splitlines() if LOADING_RE.search(line) and len(line.strip()) < 80)
+
+    @property
     def is_document(self) -> bool:
         return self.url.lower().split("?")[0].endswith(DOC_EXT) or (not self.snapshot.strip() and bool(self.url))
 
@@ -68,6 +74,7 @@ class Browser:
         self._max_elements = max_elements
         self._session: ClientSession | None = None
         self.keywords: list[str] = []          # priorização de elementos quando a tabela estoura
+        self.main_first = False                # página-alvo encontrada: navegação do site por último na tabela
         self._consent_seen: set[str] = set()
 
     async def __aenter__(self) -> "Browser":
@@ -116,7 +123,7 @@ class Browser:
         title = (TITLE_RE.search(text) or [None, ""])[1].strip()
         all_elements = parse_snapshot(snap, 800, base_url=url)
         hrefs = {e.href for e in all_elements if e.href}
-        elements = prioritize(all_elements, self.keywords, self._max_elements)
+        elements = prioritize(all_elements, self.keywords, self._max_elements, self.main_first)
         return PageState(url=url, title=title, snapshot=snap, elements=elements, hrefs=hrefs)
 
     async def dismiss_consent(self, page: PageState) -> bool:
@@ -151,6 +158,11 @@ class Browser:
 
     async def press(self, key: str) -> None:
         await self.call("browser_press_key", key=key)
+
+    async def scroll_into_view(self, el: Element) -> None:
+        """Rola o contêiner até o elemento (listas virtualizadas só renderizam o que está visível)."""
+        await self.call("browser_evaluate", function="(el) => el.scrollIntoView({block: 'end'})",
+                        element=el.describe()[:120], ref=el.ref)
 
     async def back(self) -> None:
         await self.call("browser_navigate_back")

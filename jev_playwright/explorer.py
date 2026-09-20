@@ -308,6 +308,15 @@ class JevExplorer:
             page = again
             if loaded and stable:
                 break
+        # painel embutido ainda montando (Power BI etc.): espera enquanto os placeholders de carga diminuem
+        for _ in range(self.s.wait_loading_rounds):
+            before = page.loading
+            if not before:
+                break
+            await self.browser.wait(1.5)
+            page = await self.browser.state()
+            if page.loading >= before:
+                break
         if await self.browser.dismiss_consent(page):
             page = await self.browser.state()
         return page
@@ -553,8 +562,8 @@ class JevExplorer:
         são julgados por `pagina.elementos`; informação exibida, por `pagina.conteudo`. Texto que só descreve ou
         aponta para um recurso de outro site não vale como evidência."""
         state = {"alvo": target,
-                 "pagina": {"url": page.url, "titulo": page.title, "conteudo": page.content(8000),
-                            "elementos": [e.line() for e in page.elements]},
+                 "pagina": {"url": page.url, "titulo": page.title, "conteudo": page.content(self.s.count_text_chars),
+                            "elementos": [e.line() for e in page.elements if not e.in_nav]},
                  "perguntas": {q.id: q.text for q in questions}}
         qs = {q.id: JevClient.noul(
             f"A resposta para `perguntas.{q.id}` é SIM para ESTA página (`pagina.url`)? A pergunta é sobre o que a "
@@ -571,21 +580,19 @@ class JevExplorer:
         answers = self.jev.decide(state, qs)
         return {q.id: float(answers.get(q.id, {}).get("noul", 0.0) or 0.0) for q in questions}
 
-    async def _reveal(self, question: str, target: str, page: PageState, keywords: list[str]
-                      ) -> tuple[list[str], list[str]]:
-        """Dropdowns customizados, menus, acordeões e afins escondem itens que não estão no snapshot.
-        O Jev julga (noul, 1 chamada) quais abridores da página-alvo escondem os itens pedidos; cada um
-        aceito é aberto, o que surgiu de novo no snapshot vira candidato revelado, e o abridor é fechado.
-        Devolve (candidatos revelados, notas para a evidência)."""
-        openers = opener_candidates(page.elements, page.url, keywords, self.s.max_openers_shown)
-        if not openers:
-            return [], []
+    def _pick_openers(self, question: str, target: str, page: PageState, openers: list[Element],
+                      inside: str = "") -> list[tuple[Element, float]]:
+        """Jev (noul em lote, 1 chamada): quais destes abridores escondem os itens que a pergunta manda contar?
+        `inside` descreve o abridor já aberto quando se avaliam sub-abridores (menu → submenu)."""
         state = {"alvo": target, "pergunta": question,
-                 "pagina": {"url": page.url, "titulo": page.title, "conteudo": page.content(self.s.page_text_chars)},
+                 "pagina": {"url": page.url, "titulo": page.title, "conteudo": page.content(self.s.count_text_chars)},
                  "abridores": {str(i): e.describe() for i, e in enumerate(openers, 1)}}
+        if inside:
+            state["ja_aberto"] = inside
         qs = {str(i): JevClient.noul(
             f"`pergunta` pede para CONTAR itens de um certo tipo. Os itens a contar podem estar ESCONDIDOS atrás de "
-            f"`abridores.{i}` (dropdown/seletor customizado, lista suspensa, menu, acordeão, painel de filtros) e só "
+            f"`abridores.{i}` (dropdown/seletor customizado, lista suspensa, menu, acordeão, painel de filtros"
+            + (", submenu de `ja_aberto`" if inside else "") + ") e só "
             f"aparecerem depois de abri-lo? Responda true SOMENTE se abrir esse elemento deve revelar exatamente os "
             f"itens pedidos (ex.: pergunta 'quantos anos' e o abridor é o seletor de ano). Responda false se o "
             f"abridor É um dos itens contados (ex.: pergunta 'quantos filtros' e o abridor é um filtro), se ele "
@@ -596,44 +603,135 @@ class JevExplorer:
         answers = self.jev.decide(state, qs)
         ranked = sorted(((openers[int(k) - 1], float(v.get("noul", 0.0) or 0.0)) for k, v in answers.items()
                         if k.isdigit() and int(k) <= len(openers)), key=lambda ep: -ep[1])
-        chosen = [(e, p) for e, p in ranked if p >= 0.5][: self.s.max_openers]
+        return [(e, p) for e, p in ranked if p >= 0.5]
+
+    def _pairs(self, snapshot: str, keywords: list[str]) -> list[tuple[str, str]]:
+        return candidate_pairs(snapshot, keywords, self.s.collapse_options_over)
+
+    async def _reveal(self, question: str, target: str, page: PageState, keywords: list[str]
+                      ) -> tuple[list[str], list[str]]:
+        """Dropdowns customizados, menus, acordeões e afins escondem itens que não estão no snapshot.
+        O Jev julga (noul, 1 chamada) quais abridores da página-alvo escondem os itens pedidos; cada um
+        aceito é aberto (ver `_open_and_collect`: rolagem em listas virtualizadas, autocomplete e
+        sub-abridores), o que surgiu de novo no snapshot vira candidato revelado, e o abridor é fechado.
+        Devolve (candidatos revelados, notas para a evidência)."""
+        openers = opener_candidates(page.elements, page.url, keywords, self.s.max_openers_shown)
+        if not openers:
+            return [], []
+        chosen = self._pick_openers(question, target, page, openers)[: self.s.max_openers]
         if not chosen:
             return [], []
-        base_keys = {k for k, _d in candidate_pairs(page.snapshot)}
+        base_keys = {k for k, _d in self._pairs(page.snapshot, keywords)}
         revealed: list[str] = []
         seen: set[str] = set()
         notes: list[str] = []
         for el, p in chosen:
-            fresh = await self.browser.state()
-            live = fresh.find(el.signature)
-            label = f"{el.role} '{el.name}'"
+            live = (await self.browser.state()).find(el.signature)
+            label = f"{el.role} '{el.name or el.detail}'"
             if live is None:
                 notes.append(f"abridor {label} não encontrado")
                 continue
-            tabs_before = await self.browser.tabs()
-            try:
-                await self.browser.click(live)
-            except RuntimeError as exc:
-                notes.append(f"abridor {label}: erro ao clicar ({str(exc)[:40]})")
-                continue
-            await self.browser.wait(0.6)
-            await self.browser.close_new_tabs(tabs_before)  # abridor que abriu nova aba: descarta só a aba nova
-            opened = await self.browser.state()
-            if opened.url.rstrip("/") != page.url.rstrip("/"):
-                notes.append(f"abridor {label} navegou para outra página; ignorado")
-                await self.browser.navigate(page.url)
-                await self._ready()
-                continue
-            new = [(k, d) for k, d in candidate_pairs(opened.snapshot) if k not in base_keys and k not in seen]
-            for k, d in new:
-                seen.add(k)
-                revealed.append(f"{d} · revelado ao abrir {label}")
-            self.log(f"    contar: abrir {label} (P={p:.2f}) revelou {len(new)} item(ns)")
-            notes.append(f"abrir {label} revelou {len(new)} item(ns)")
-            await self._close_opener(page, live, base_keys)
+            ok = await self._open_and_collect(question, target, page, live, label, p, base_keys, seen, revealed,
+                                              notes, keywords, depth=1)
+            if ok:
+                await self._close_opener(page, live, base_keys, keywords)
         return revealed, notes
 
-    async def _close_opener(self, page: PageState, opener: Element, base_keys: set[str]) -> None:
+    async def _open_and_collect(self, question: str, target: str, page: PageState, live: Element, label: str,
+                                p: float, base_keys: set[str], seen: set[str], revealed: list[str],
+                                notes: list[str], keywords: list[str], depth: int) -> bool:
+        """Abre um abridor e recolhe o que apareceu de novo. Três casos que um clique só não resolve:
+        - autocomplete: nada aparece ao clicar → ArrowDown, depois digitar uma letra;
+        - lista virtualizada: só as opções visíveis estão no snapshot → rola até a última revelada e repete
+          o diff enquanto surgirem itens novos (até `max_scroll_rounds`);
+        - mais de um nível: entre os itens revelados há novos abridores (submenu, painel) → o Jev escolhe
+          (1 chamada) e até `max_sub_openers` são abertos, até `max_reveal_depth` níveis.
+        Devolve False se o abridor navegou para outra página (já restaurada)."""
+        tabs_before = await self.browser.tabs()
+        try:
+            await self.browser.click(live)
+        except RuntimeError as exc:
+            notes.append(f"abridor {label}: erro ao clicar ({str(exc)[:40]})")
+            return True
+        await self.browser.wait(0.6)
+        await self.browser.close_new_tabs(tabs_before)  # abridor que abriu nova aba: descarta só a aba nova
+        opened = await self.browser.state()
+        if opened.url.rstrip("/") != page.url.rstrip("/"):
+            notes.append(f"abridor {label} navegou para outra página; ignorado")
+            await self.browser.navigate(page.url)
+            await self._ready()
+            return False
+
+        def diff(state: PageState) -> list[tuple[str, str]]:
+            return [(k, d) for k, d in self._pairs(state.snapshot, keywords) if k not in base_keys and k not in seen]
+
+        new = diff(opened)
+        if not new and (live.kind == "type" or live.role == "combobox"):
+            # autocomplete: a lista só aparece com teclado/digitação
+            for action in ("ArrowDown", "type"):
+                try:
+                    if action == "type":
+                        await self.browser.type(live, "a")
+                    else:
+                        await self.browser.press(action)
+                except RuntimeError:
+                    continue
+                await self.browser.wait(0.6)
+                opened = await self.browser.state()
+                new = diff(opened)
+                if new:
+                    notes.append(f"{label}: lista apareceu com {'digitação' if action == 'type' else action}")
+                    break
+        for k, d in new:
+            seen.add(k)
+            revealed.append(f"{d} · revelado ao abrir {label}")
+        total = len(new)
+
+        # lista virtualizada: rola até o último item revelado e vê se aparecem mais
+        for _ in range(self.s.max_scroll_rounds if new else 0):
+            last_key = new[-1][0]  # "papel|nome" ou "papel|nome|detalhe" (ver candidate_pairs)
+            anchor = next((e for e in reversed(opened.elements)
+                           if last_key in (f"{e.role}|{normalize(e.name)}", f"{e.role}|{normalize(e.name)}|{normalize(e.detail)}")),
+                          None)
+            if anchor is None:
+                break
+            try:
+                await self.browser.scroll_into_view(anchor)
+            except RuntimeError:
+                break
+            await self.browser.wait(0.5)
+            opened = await self.browser.state()
+            new = diff(opened)
+            if not new:
+                break
+            for k, d in new:
+                seen.add(k)
+                revealed.append(f"{d} · revelado ao abrir {label} (após rolar)")
+            total += len(new)
+            notes.append(f"{label}: rolagem revelou +{len(new)}")
+
+        self.log(f"    contar: abrir {label} (P={p:.2f}) revelou {total} item(ns)")
+        notes.append(f"abrir {label} revelou {total} item(ns)")
+
+        # segundo nível: abridores que só existem depois de abrir este
+        if depth < self.s.max_reveal_depth:
+            base_sigs = {e.signature for e in page.elements}
+            fresh = [e for e in opened.elements if e.signature not in base_sigs and e.signature != live.signature]
+            subs = opener_candidates(fresh, page.url, keywords, self.s.max_openers_shown)
+            if subs:
+                chosen = self._pick_openers(question, target, opened, subs, inside=label)[: self.s.max_sub_openers]
+                for sub, sp in chosen:
+                    live_sub = (await self.browser.state()).find(sub.signature)
+                    if live_sub is None:
+                        continue
+                    sub_label = f"{sub.role} '{sub.name or sub.detail}' (dentro de {label})"
+                    ok = await self._open_and_collect(question, target, page, live_sub, sub_label, sp, base_keys,
+                                                      seen, revealed, notes, keywords, depth + 1)
+                    if not ok:
+                        return False
+        return True
+
+    async def _close_opener(self, page: PageState, opener: Element, base_keys: set[str], keywords: list[str]) -> None:
         """Fecha o que foi aberto: Escape; se ainda houver itens extras, reclica o abridor; por fim recarrega."""
         try:
             await self.browser.press("Escape")
@@ -641,7 +739,7 @@ class JevExplorer:
         except RuntimeError:
             pass
         after = await self.browser.state()
-        if not {k for k, _d in candidate_pairs(after.snapshot)} - base_keys:
+        if not {k for k, _d in self._pairs(after.snapshot, keywords)} - base_keys:
             return
         again = after.find(opener.signature)
         if again is not None:
@@ -651,7 +749,7 @@ class JevExplorer:
             except RuntimeError:
                 pass
             after = await self.browser.state()
-            if not {k for k, _d in candidate_pairs(after.snapshot)} - base_keys:
+            if not {k for k, _d in self._pairs(after.snapshot, keywords)} - base_keys:
                 return
         await self.browser.navigate(page.url)
         await self._ready()
@@ -662,12 +760,13 @@ class JevExplorer:
         Devolve (n, confiança, evidência, fonte)."""
         keywords = keywords_from(question)
         revealed, notes = await self._reveal(question, target, page, keywords)
-        cands = count_candidates(page.snapshot, keywords, self.s.max_count_candidates, revealed)
+        cands = count_candidates(page.snapshot, keywords, self.s.max_count_candidates, revealed,
+                                 self.s.collapse_options_over)
         if not cands:
             n, ev = self._count_llm(question, target, page)
             return n, 0.0, ev, "llm"
         state = {"alvo": target, "pergunta": question,
-                 "pagina": {"url": page.url, "titulo": page.title, "conteudo": page.content(self.s.page_text_chars)},
+                 "pagina": {"url": page.url, "titulo": page.title, "conteudo": page.content(self.s.count_text_chars)},
                  "candidatos": {str(i): c for i, c in enumerate(cands, 1)}}
         probs: dict[str, float] = {}
         for start in range(0, len(cands), self.s.count_batch):
@@ -713,9 +812,14 @@ class JevExplorer:
             for q in section.questions:
                 self.log(f"    {q.id} [{kinds[q.id]}] {q.text}")
             keywords = keywords_from(section.title)
+            self.browser.main_first = False   # na busca, os menus do site são o caminho
             page = await self.find(target, keywords, result)
             status = f"encontrado em {result.clicks} clique(s)" if result.found else "não encontrado"
             self.log(f"    alvo: {status}  (P={result.found_prob:.2f}, {result.pages_visited} páginas avaliadas)")
+            # na página-alvo, o que importa é o conteúdo (inclusive iframes): navegação por último na tabela
+            self.browser.main_first = True
+            if page is not None:
+                page = await self.browser.state()
 
             judge_qs = [q for q in section.questions if kinds[q.id] == "julgar_pagina"]
             judged = self._judge(judge_qs, target, page) if (judge_qs and page is not None) else {}

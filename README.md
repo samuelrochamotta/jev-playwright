@@ -90,7 +90,7 @@ Respostas quando o alvo não é encontrado: `encontrar` → `não`; `cliques` �
 | Poda | em código: links já visitados, já clicados, fora do site, documentos (PDF/XLS), páginas de captcha | – |
 | Nº de cliques | profundidade do caminho vencedor; atalho em código se uma página anterior já linkava direto para a URL final (cliques dentro da página final, como abas, continuam contando) | o LLM conta |
 | Perguntas sim/não sobre a página-alvo | Jev `noul` **em lote, 1 chamada** | LLM |
-| Contagem (`contar`) | 1) Jev `noul` (1 chamada) sobre os "abridores" da página-alvo (combobox customizado, botão, aba, acordeão, link sem URL própria): "abrir isto revela os itens pedidos?"; os aceitos (P ≥ 0,5, até `MAX_OPENERS`) são clicados, o que surge de novo no snapshot vira candidato "revelado ao abrir X", e o abridor é fechado (Escape → reclique → recarga); 2) candidatos revelados + visíveis (filtros, campos, colunas, opções, abas, links, títulos), deduplicados; Jev `noul` por candidato em lotes de 25 ("é um dos itens pedidos?"); resposta = nº de "sim" | LLM |
+| Contagem (`contar`) | 1) Jev `noul` (1 chamada) sobre os "abridores" da página-alvo (combobox customizado, botão, aba, acordeão, link sem URL própria; menus do site ficam de fora): "abrir isto revela os itens pedidos?"; os aceitos (P ≥ 0,5, até `MAX_OPENERS`) são clicados, o que surge de novo no snapshot vira candidato "revelado ao abrir X"; se nada surgir num combobox, ArrowDown e digitação (autocomplete); se a lista for virtualizada, rola até o último item revelado e repete; entre os itens revelados, novos abridores (submenu) passam pelo Jev de novo e são abertos (até `MAX_REVEAL_DEPTH` níveis); por fim o abridor é fechado (Escape → reclique → recarga); 2) candidatos revelados + visíveis (filtros, campos, colunas, opções, abas, links, títulos), sem cabeçalho/menus/rodapé do site, deduplicados por (papel, nome, texto do filho) — dois links "Clique para exportar" viram "Exportar xlsx" e "Exportar csv" —, e um listbox com mais de `COLLAPSE_OPTIONS_OVER` opções vira um candidato só salvo quando a pergunta é sobre ele; Jev `noul` por candidato em lotes de 25 ("é um dos itens pedidos?"); resposta = nº de "sim" | LLM |
 | Cookies / nova aba / desafio anti-robô | política em código, nos dois modos | idem |
 
 **Fallback de LLM em `contar`.** Só quando a página-alvo não tem nenhum candidato enumerável (snapshot sem elementos
@@ -121,11 +121,14 @@ Limitações observadas nos testes:
   de desafio e responde `indeterminado (bloqueio anti-robô)` em vez de `não`.
 - A busca é em profundidade limitada (`MAX_DEPTH`, `MAX_PAGES_PER_FIND`); o número de cliques é o do melhor caminho
   encontrado, não um mínimo garantido.
-- Conteúdo dentro de iframes não aparece no snapshot de acessibilidade — afeta `julgar_pagina` e `contar` em
-  painéis embutidos (Power BI etc.).
-- `contar` abre até `MAX_OPENERS` dropdowns/menus customizados por pergunta (um clique cada) para revelar itens
-  escondidos; listas que exigem mais de um nível de abertura, rolagem interna ou digitação (autocomplete) continuam
-  fora. Em Recife, "quantos anos" só responde 4 (2023–2026) porque o seletor "Ano da Emenda" é aberto antes de contar.
+- Conteúdo de iframes (Power BI, Looker...) **aparece** no snapshot do Playwright MCP (refs com prefixo de frame,
+  `f3e553`), mas painéis levam alguns segundos a mais para montar: `_ready` espera enquanto os placeholders
+  "carregando..." diminuem (`WAIT_LOADING_ROUNDS`). Listas virtualizadas dentro deles (slicers) só expõem as
+  opções renderizadas; `contar` rola até a última revelada e repete (`MAX_SCROLL_ROUNDS`).
+- `contar` abre até `MAX_OPENERS` dropdowns/menus customizados por pergunta para revelar itens escondidos, em até
+  `MAX_REVEAL_DEPTH` níveis (menu → submenu, `MAX_SUB_OPENERS` por nível), com ArrowDown/digitação para
+  autocomplete. Em Recife, "quantos anos" só responde 4 (2023–2026) porque o seletor "Ano da Emenda" é aberto
+  antes de contar.
 
 ## Estrutura
 

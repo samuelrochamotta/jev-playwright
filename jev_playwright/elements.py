@@ -37,6 +37,46 @@ CONSENT_CONTEXT_RE = re.compile(r"cookie|lgpd|privacidade|privacy|consentimento|
 STOPWORDS = {"existência", "existencia", "seção", "secao", "específica", "especifica", "portal", "possui", "para",
              "sobre", "site", "página", "pagina", "área", "area", "menu", "link", "informações", "informacoes",
              "dados", "consulta", "consultas", "transparência", "transparencia", "quantos", "cliques", "necessários"}
+# Subárvores de navegação do site (cabeçalho, menus, rodapé): não são conteúdo da página-alvo.
+NAV_SUBTREE_ROLES = {"banner", "navigation", "contentinfo"}
+# Placeholders de painéis ainda carregando (Power BI, Looker...): o snapshot foi tirado cedo demais.
+LOADING_RE = re.compile(r"carregando|loading|aguarde|please wait", re.I)
+
+
+def iter_snapshot(text: str):
+    """Gera (índice, linha, dentro_de_navegação) para cada linha não vazia do snapshot, seguindo a
+    indentação: tudo abaixo de um nó banner/navigation/contentinfo é navegação. Conteúdo de iframes
+    (refs `f2e10`) vem aninhado como qualquer outro nó e é tratado como conteúdo normal."""
+    nav_indent: int | None = None
+    for i, raw in enumerate(text.splitlines()):
+        if not raw.strip():
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if nav_indent is not None and indent <= nav_indent:
+            nav_indent = None
+        m = LINE_RE.match(raw)
+        if nav_indent is None and m and m.group("role") in NAV_SUBTREE_ROLES:
+            nav_indent = indent
+        yield i, raw, nav_indent is not None
+
+
+def _child_text(lines: list[str], i: int, indent: int, max_lines: int = 8) -> str:
+    """Texto do primeiro filho de texto de um nó (`- generic: Exportar xlsx`, `- text: ...`, `- img "..."`).
+    É o que distingue elementos cujo nome ARIA é genérico ou repetido."""
+    for child in lines[i + 1:i + 1 + max_lines]:
+        if not child.strip():
+            continue
+        if len(child) - len(child.lstrip()) <= indent:
+            break
+        if URL_RE.match(child):
+            continue
+        cm = LINE_RE.match(child)
+        if not cm:
+            continue
+        txt = (cm.group("rest") or "").strip().strip('"') or (cm.group("name") or "").strip()
+        if txt and len(txt) <= 60 and not LOADING_RE.search(txt):
+            return txt
+    return ""
 
 
 def normalize(text: str) -> str:
@@ -69,6 +109,8 @@ class Element:
     options: list[str] = field(default_factory=list)
     context: str = ""
     href: str = ""
+    detail: str = ""      # texto do filho, usado quando o nome ARIA é genérico ou repetido na página
+    in_nav: bool = False  # dentro de banner/navigation/contentinfo
 
     @property
     def kind(self) -> str:
@@ -80,11 +122,17 @@ class Element:
 
     @property
     def signature(self) -> str:
-        """Identidade estável entre snapshots (os refs mudam a cada snapshot)."""
-        return f"{self.role}|{normalize(self.name)}|{self.href}"
+        """Identidade estável entre snapshots (os refs mudam a cada snapshot). O `detail` entra quando
+        o nome sozinho não distingue o elemento (dois links "Clique para exportar" → xlsx e csv)."""
+        s = f"{self.role}|{normalize(self.name)}|{self.href}"
+        return f"{s}|{normalize(self.detail)}" if self.detail else s
 
     def describe(self) -> str:
-        s = f"{self.role} '{self.name}'" if self.name else self.role
+        # texto visível na frente: o nome ARIA de botões de painel costuma ser boilerplate ("Clique para exportar")
+        if self.detail:
+            s = f"{self.role} '{self.detail}' · nome acessível: '{self.name}'"
+        else:
+            s = f"{self.role} '{self.name}'" if self.name else self.role
         if self.value:
             s += f" · valor atual: '{self.value}'"
         if self.options:
@@ -103,6 +151,14 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
     """Extrai apenas os elementos interativos (com ref) do snapshot, na ordem do documento."""
     elements: list[Element] = []
     lines = text.splitlines()
+    nav_of = {i: in_nav for i, _raw, in_nav in iter_snapshot(text)}
+    # nomes que se repetem na página (mesmo papel + nome): precisam do texto do filho para se distinguir
+    counts: dict[str, int] = {}
+    for raw in lines:
+        m = LINE_RE.match(raw)
+        if m and m.group("name") and REF_RE.search(m.group("attrs") or ""):
+            k = f"{m.group('role')}|{normalize(m.group('name'))}"
+            counts[k] = counts.get(k, 0) + 1
     recent_text: list[str] = []
     for i, raw in enumerate(lines):
         m = LINE_RE.match(raw)
@@ -131,8 +187,12 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
             name, value = value, ""
         context = " | ".join(recent_text) if name.lower() in GENERIC_NAMES or not name else ""
         el = Element(index=len(elements) + 1, ref=ref.group(1), role=role, name=name, value=value,
-                     attrs=attrs, context=context)
+                     attrs=attrs, context=context, in_nav=nav_of.get(i, False))
         indent = len(raw) - len(raw.lstrip())
+        if name and (normalize(name) in GENERIC_NAMES or counts.get(f"{role}|{normalize(name)}", 0) > 1):
+            detail = _child_text(lines, i, indent)
+            if detail and normalize(detail) != normalize(name):
+                el.detail = detail
         for child in lines[i + 1:i + 3]:
             if not child.strip():
                 continue
@@ -158,9 +218,12 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
     return elements
 
 
-def prioritize(elements: list[Element], keywords: list[str], max_elements: int) -> list[Element]:
+def prioritize(elements: list[Element], keywords: list[str], max_elements: int,
+               main_first: bool = False) -> list[Element]:
     """Deduplica (mesmo nome+url) e, se a tabela estoura o limite, mantém primeiro os elementos
-    cujo nome/contexto contém palavras-chave do alvo. Reindexa a partir de 1."""
+    cujo nome/contexto contém palavras-chave do alvo. Com `main_first` (página-alvo já encontrada), os
+    elementos de navegação do site ficam por último, para o conteúdo (inclusive iframes) não ser cortado.
+    Reindexa a partir de 1."""
     seen: set[str] = set()
     unique: list[Element] = []
     for e in elements:
@@ -169,11 +232,13 @@ def prioritize(elements: list[Element], keywords: list[str], max_elements: int) 
             continue
         seen.add(sig)
         unique.append(e)
-    if len(unique) > max_elements and keywords:
+    if len(unique) > max_elements:
         def hit(e: Element) -> bool:
-            blob = normalize(e.name + " " + e.context + " " + e.href)
+            blob = normalize(e.name + " " + e.detail + " " + e.context + " " + e.href)
             return any(k in blob for k in keywords)
-        unique = [e for e in unique if hit(e)] + [e for e in unique if not hit(e)]
+        def rank(e: Element) -> tuple[int, int]:
+            return (0 if keywords and hit(e) else 1, 1 if main_first and e.in_nav else 0)
+        unique = sorted(unique, key=rank)  # estável: mantém a ordem do documento dentro de cada grupo
     unique = unique[:max_elements]
     for i, e in enumerate(unique, 1):
         e.index = i
@@ -215,10 +280,16 @@ NAV_LINE_RE = re.compile(r"""^\s*-\s+(link|button|img|menuitem|tab|listitem|list
 
 def content_text(text: str, limit: int = 4000) -> str:
     """Conteúdo principal da página: descarta linhas que são só link/botão/menu (navegação) e mantém
-    títulos, parágrafos, textos, tabelas. É o que o Jev lê para julgar se a página É o alvo."""
+    títulos, parágrafos, textos, tabelas. É o que o Jev lê para julgar se a página É o alvo.
+    Cabeçalho/menus/rodapé do site (banner, navigation, contentinfo) ficam de fora, exceto títulos;
+    placeholders de carga ("Os visuais estão carregando...") também."""
     out = []
-    for raw in text.splitlines():
+    for _i, raw, in_nav in iter_snapshot(text):
         if URL_RE.match(raw) or NAV_LINE_RE.match(raw):
+            continue
+        if in_nav and not re.match(r"^\s*-\s+heading\b", raw):
+            continue
+        if LOADING_RE.search(raw) and len(raw.strip()) < 80:
             continue
         s = REF_RE.sub("", raw)
         s = re.sub(r"\s*\[(cursor=pointer|active|level=\d+|aria-hidden|selected|checked|expanded|disabled)\]", "", s)
@@ -235,14 +306,51 @@ def content_text(text: str, limit: int = 4000) -> str:
 COUNTABLE_ROLES = CLICKABLE | TYPEABLE | SELECTABLE | {"columnheader", "heading", "cell", "img", "row"}
 
 
-def candidate_pairs(snapshot: str) -> list[tuple[str, str]]:
+def _options_below(lines: list[str], i: int, indent: int) -> list[str]:
+    """Nomes das `option` aninhadas sob a linha i (listbox/combobox)."""
+    out: list[str] = []
+    for child in lines[i + 1:]:
+        if child.strip() and len(child) - len(child.lstrip()) <= indent:
+            break
+        cm = LINE_RE.match(child)
+        if cm and cm.group("role") == "option" and cm.group("name"):
+            out.append(cm.group("name"))
+    return out
+
+
+def candidate_pairs(snapshot: str, keywords: list[str] | None = None, collapse_over: int = 0,
+                    skip_nav: bool = True) -> list[tuple[str, str]]:
     """(chave, descrição) de cada elemento nomeado do snapshot que pode ser item de uma contagem
-    (interativo ou estrutural: cabeçalho de coluna, opção, aba, título...), deduplicado por (papel, nome)."""
+    (interativo ou estrutural: cabeçalho de coluna, opção, aba, título...), deduplicado por (papel, nome).
+
+    - Navegação do site (banner/menus/rodapé) fica de fora com `skip_nav`.
+    - Nomes genéricos ou repetidos ganham o texto do filho ("Clique para exportar" → "Exportar xlsx" /
+      "Exportar csv"), que também entra na chave, para não colapsarem num só.
+    - Um listbox com mais de `collapse_over` opções (slicer de parlamentares num painel) vira UM candidato
+      "listbox 'X' · N opções" e as opções são puladas — a não ser que alguma palavra-chave da pergunta case
+      com o nome do listbox ou com uma opção, caso em que as opções são exatamente o que se conta."""
+    lines = snapshot.splitlines()
+    nav_flags = {i: in_nav for i, _raw, in_nav in iter_snapshot(snapshot)}
+    counts: dict[str, int] = {}
+    for raw in lines:
+        m = LINE_RE.match(raw)
+        if m and m.group("name"):
+            k = f"{m.group('role')}|{normalize(m.group('name'))}"
+            counts[k] = counts.get(k, 0) + 1
+    kws = keywords or []
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
-    for raw in snapshot.splitlines():
+    skip_indent: int | None = None
+    for i, raw in enumerate(lines):
         m = LINE_RE.match(raw)
         if not m:
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if skip_indent is not None:
+            if indent > skip_indent:
+                continue
+            skip_indent = None
+        if skip_nav and nav_flags.get(i, False):
             continue
         role, attrs = m.group("role"), m.group("attrs") or ""
         name = (m.group("name") or "").replace('\\"', '"').strip()
@@ -251,13 +359,26 @@ def candidate_pairs(snapshot: str) -> list[tuple[str, str]]:
             name = rest
         if role not in COUNTABLE_ROLES and not (role == "generic" and "cursor=pointer" in attrs):
             continue
-        if not name or len(name) > 120:
+        if not name or len(name) > 120 or LOADING_RE.search(name) and len(name) < 60:
             continue
-        key = f"{role}|{normalize(name)}"
+        detail = ""
+        if normalize(name) in GENERIC_NAMES or counts.get(f"{role}|{normalize(name)}", 0) > 1:
+            detail = _child_text(lines, i, indent)
+            if normalize(detail) == normalize(name):
+                detail = ""
+        key = f"{role}|{normalize(name)}" + (f"|{normalize(detail)}" if detail else "")
         if key in seen:
             continue
         seen.add(key)
-        desc = f"{role} '{name}'"
+        desc = f"{role} '{detail}' · nome acessível: '{name}'" if detail else f"{role} '{name}'"
+        if role in SELECTABLE and collapse_over:
+            options = _options_below(lines, i, indent)
+            if len(options) > collapse_over:
+                blob = normalize(name + " " + " ".join(options))
+                if not any(k in blob for k in kws):
+                    out.append((key, f"{desc} · {len(options)} opções (colapsadas)"))
+                    skip_indent = indent
+                    continue
         if rest and rest != name and role in SELECTABLE | TYPEABLE and len(rest) <= 60:
             desc += f" · valor atual: '{rest}'"
         out.append((key, desc))
@@ -265,11 +386,11 @@ def candidate_pairs(snapshot: str) -> list[tuple[str, str]]:
 
 
 def count_candidates(snapshot: str, keywords: list[str], max_candidates: int = 80,
-                     revealed: list[str] | None = None) -> list[str]:
+                     revealed: list[str] | None = None, collapse_over: int = 0) -> list[str]:
     """Candidatos para uma pergunta `contar`: os itens revelados ao abrir dropdowns/menus (se houver) vêm
-    primeiro, seguidos dos elementos visíveis do snapshot. Se estourar o limite, mantém primeiro os que
-    casam com palavras-chave da pergunta."""
-    out = list(revealed or []) + [d for _k, d in candidate_pairs(snapshot)]
+    primeiro, seguidos dos elementos visíveis do snapshot (sem a navegação do site). Se estourar o
+    limite, mantém primeiro os que casam com palavras-chave da pergunta."""
+    out = list(revealed or []) + [d for _k, d in candidate_pairs(snapshot, keywords, collapse_over)]
     if len(out) > max_candidates and keywords:
         def hit(desc: str) -> bool:
             return any(k in normalize(desc) for k in keywords)
@@ -290,6 +411,8 @@ def opener_candidates(elements: list[Element], page_url: str, keywords: list[str
     base = page_url.rstrip("/")
     out: list[Element] = []
     for e in elements:
+        if e.in_nav:
+            continue  # menus do site não escondem itens da página-alvo
         if e.role in SELECTABLE and e.options:
             continue  # <select> nativo: as opções já estão no snapshot
         if e.href and e.href.rstrip("/") != base:
@@ -304,7 +427,7 @@ def opener_candidates(elements: list[Element], page_url: str, keywords: list[str
         out.append(e)
 
     def hit(e: Element) -> bool:
-        blob = normalize(e.name + " " + e.context)
+        blob = normalize(e.name + " " + e.detail + " " + e.context)
         return any(k in blob for k in keywords)
     out = [e for e in out if hit(e)] + [e for e in out if not hit(e)]
     return out[:max_openers]

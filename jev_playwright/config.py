@@ -41,8 +41,14 @@ class Settings:
     # --- perguntas `contar` ---
     max_count_candidates: int = 80   # candidatos da página-alvo enviados ao Jev para contagem
     count_batch: int = 25            # candidatos julgados (noul) por chamada ao Jev
+    count_text_chars: int = 8000     # trecho de texto da página-alvo enviado ao Jev nas contagens
+    collapse_options_over: int = 20  # listbox com mais opções que isso vira um candidato só (salvo palavra-chave)
     max_openers_shown: int = 12      # elementos "abridores" (dropdown/menu/acordeão) mostrados ao Jev
     max_openers: int = 4             # abridores efetivamente abertos por pergunta `contar`
+    max_reveal_depth: int = 2        # níveis de abertura (menu → submenu) por abridor
+    max_sub_openers: int = 2         # sub-abridores abertos dentro de cada abridor
+    max_scroll_rounds: int = 4       # rolagens dentro de uma lista virtualizada para revelar mais itens
+    wait_loading_rounds: int = 4     # esperas extras enquanto o snapshot tem placeholders de carga
     # --- baseline llm-only ---
     llm_explore_turns: int = 25      # turnos do LLM por seção
 
@@ -61,6 +67,13 @@ def load_settings() -> Settings:
         max_depth=_env_int("MAX_DEPTH", 4),
         max_pages_per_find=_env_int("MAX_PAGES_PER_FIND", 14),
         max_count_candidates=_env_int("MAX_COUNT_CANDIDATES", 80),
+        count_text_chars=_env_int("COUNT_TEXT_CHARS", 8000),
+        collapse_options_over=_env_int("COLLAPSE_OPTIONS_OVER", 20),
+        max_openers_shown=_env_int("MAX_OPENERS_SHOWN", 12),
         max_openers=_env_int("MAX_OPENERS", 4),
+        max_reveal_depth=_env_int("MAX_REVEAL_DEPTH", 2),
+        max_sub_openers=_env_int("MAX_SUB_OPENERS", 2),
+        max_scroll_rounds=_env_int("MAX_SCROLL_ROUNDS", 4),
+        wait_loading_rounds=_env_int("WAIT_LOADING_ROUNDS", 4),
         llm_explore_turns=_env_int("LLM_EXPLORE_TURNS", 25),
     )
