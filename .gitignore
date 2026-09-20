@@ -1,0 +1,5 @@
+.env
+.playwright-mcp/
+reports/**/*.json
+reports/**/*.md
+__pycache__/
