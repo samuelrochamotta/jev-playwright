@@ -3,3 +3,5 @@
 reports/**/*.json
 reports/**/*.md
 __pycache__/
+
+.claude/*
