@@ -79,6 +79,30 @@ def _child_text(lines: list[str], i: int, indent: int, max_lines: int = 8) -> st
     return ""
 
 
+def canonical_href(base_url: str, href: str) -> str:
+    """URL absoluta sem âncora interna (`#topo`), mas preservando rotas de SPA por hash (`#/Emendas`,
+    `#!/x`): nelas o fragmento É a página, e sem ele todos os links do site viram a raiz."""
+    full = urljoin(base_url, href) if base_url else href
+    url, frag = urldefrag(full)
+    return full if frag.startswith(("/", "!")) else url
+
+
+def _wraps_link(lines: list[str], i: int, indent: int) -> bool:
+    """Nó cujo primeiro filho é um link com URL (`button` > `link "Federais"` > `/url`): clicar no
+    envoltório costuma só mover o foco; o link de dentro é o elemento real."""
+    for child in lines[i + 1:i + 4]:
+        if not child.strip():
+            continue
+        if len(child) - len(child.lstrip()) <= indent:
+            return False
+        cm = LINE_RE.match(child)
+        if not cm or cm.group("role") != "link" or not REF_RE.search(cm.group("attrs") or ""):
+            return False
+        nxt = next((c for c in lines[i + 2:i + 5] if c.strip()), "")
+        return bool(URL_RE.match(nxt))
+    return False
+
+
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKD", text or "")
     return "".join(c for c in text if not unicodedata.combining(c)).lower().strip()
@@ -187,6 +211,8 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
             # `generic [cursor=pointer]: Texto` — filtro/aba/card clicável sem papel ARIA: o texto é o nome
             name, value = value, ""
         if not name and role in CLICKABLE:
+            if _wraps_link(lines, i, indent):
+                continue  # envoltório sem nome de um link: o link (com URL) já entra na tabela
             # link/botão sem nome ARIA cujo filho é uma imagem ou texto (`- img "emendas banner 2026"`):
             # o texto do filho é o nome, senão o Jev vê só "link · url: ..."
             name = _child_text(lines, i, indent)
@@ -204,7 +230,7 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
             if mu and len(child) - len(child.lstrip()) > indent:
                 href = mu.group(1).strip()
                 if href and href != "#" and not href.startswith("javascript"):
-                    el.href = urldefrag(urljoin(base_url, href) if base_url else href)[0]
+                    el.href = canonical_href(base_url, href)
             break
         if not name and not el.href and role not in CLICKABLE | TYPEABLE | SELECTABLE:
             continue  # wrapper genérico clicável sem nome: ruído (o link nomeado dentro dele já entra)

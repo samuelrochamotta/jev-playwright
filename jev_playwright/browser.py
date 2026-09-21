@@ -18,6 +18,7 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML
       "Chrome/128.0.0.0 Safari/537.36")
 CHALLENGE_RE = re.compile(r"captcha|visitante leg[ií]timo|digite o c[oó]digo que aparece|verify you are (a )?human|"
                           r"n[aã]o sou um rob[oô]|access denied|acesso negado|request blocked|attention required", re.I)
+ACTIVE_RE = re.compile(r"\s*\[active\]")  # marcador de foco: muda a cada clique sem mudar a página
 DOC_EXT = (".pdf", ".xls", ".xlsx", ".csv", ".ods", ".doc", ".docx", ".zip")
 
 
@@ -38,7 +39,9 @@ class PageState:
 
     @property
     def hash(self) -> str:
-        return hashlib.sha1((self.url + "\n" + self.snapshot).encode()).hexdigest()[:12]
+        """Identidade do estado da página. Ignora `[active]` (foco): um clique que só move o foco, como num
+        botão-envoltório ou num item de menu que nada faz, não é uma página nova."""
+        return hashlib.sha1((self.url + "\n" + ACTIVE_RE.sub("", self.snapshot)).encode()).hexdigest()[:12]
 
     @property
     def is_challenge(self) -> bool:

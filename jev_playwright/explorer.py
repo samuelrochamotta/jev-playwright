@@ -363,6 +363,11 @@ class JevExplorer:
             await self.browser.type(el, query, submit=True)
         await self.browser.wait(0.8)
         new_tab = op in ("CLICK", "SEARCH") and await self.browser.focus_newest_tab()
+        if not new_tab and op == "CLICK" and el is not None and el.href and not self._same_site(el.href):
+            # link para outro domínio costuma abrir nova aba, e ela pode demorar a aparecer: sem esta espera o
+            # clique é tomado por "não mudou a página" e o sistema terceirizado fica de fora
+            await self.browser.wait(1.5)
+            new_tab = await self.browser.focus_newest_tab()
         return await self._ready(), new_tab
 
     async def _backtrack(self, stack: list[Frame], visited: set[str], evaluated: set[str], trace: list[str]) -> PageState | None:
