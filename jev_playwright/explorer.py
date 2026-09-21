@@ -565,11 +565,25 @@ class JevExplorer:
                 break
             result.pages_visited += 1
             # já num sistema terceirizado: os links "externos" são os da própria página
-            ans2 = self._decide(target, new_page, stack, discarded, visited, external=not self._same_site(new_page.url))
+            is_external = not self._same_site(new_page.url)
+            ans2 = self._decide(target, new_page, stack, discarded, visited, external=is_external)
             prob2 = float(ans2.get("chegou", {}).get("noul", 0.0) or 0.0)
             exact2 = float(ans2.get("exato", {}).get("noul", 0.0) or 0.0)
             self.log(f"    Jev [{len(stack)}+] refinamento {label}: P(tema)={prob2:.2f} P(exato)={exact:.2f}→{exact2:.2f}")
-            if prob2 >= self.s.arrive_threshold and exact2 > exact:
+            if is_external and prob - prob2 > self.s.refine_retry_drop:
+                # sistema terceirizado (nova aba) que pode ainda estar montando a página quando o snapshot foi
+                # tirado: espera mais, refaz o snapshot e consulta o Jev de novo antes de descartar
+                await self.browser.wait(2.0)
+                again = await self._ready()
+                if again.hash != new_page.hash:
+                    new_page = again
+                ans2 = self._decide(target, new_page, stack, discarded, visited, external=True)
+                prob2 = float(ans2.get("chegou", {}).get("noul", 0.0) or 0.0)
+                exact2 = float(ans2.get("exato", {}).get("noul", 0.0) or 0.0)
+                self.log(f"    Jev [{len(stack)}+] refinamento {label} (reavaliação): P(tema)={prob2:.2f} "
+                         f"P(exato)={exact:.2f}→{exact2:.2f}")
+                trace.append(f"· página externa reavaliada após espera (tema={prob2:.2f}, exato={exact2:.2f})")
+            if prob2 >= self.s.arrive_threshold and exact2 >= exact + self.s.refine_min_gain:
                 stack.append(Frame(before.url, self._links(before), [], {el.signature}, [],
                                    PathStep("click", label, new_page.url, new_tab)))
                 trace.append(f"→ [{len(stack)}] {stack[-1].step.label()} → {new_page.url} "

@@ -37,6 +37,8 @@ class Settings:
     max_alternatives: int = 4        # alternativas guardadas por página para backtracking
     max_refine_steps: int = 2        # cliques extras dentro da seção do tema para satisfazer qualificadores
     refine_min_prob: float = 0.5     # P mínima do sub-alvo (aba/filtro) para tentar o refinamento
+    refine_min_gain: float = 0.05    # ganho mínimo em P(exato) para aceitar um passo de refinamento
+    refine_retry_drop: float = 0.3   # em página externa, queda de P(tema) maior que isso reavalia após esperar
     page_text_chars: int = 3500      # trecho de texto da página enviado ao Jev
     # --- perguntas `contar` ---
     max_count_candidates: int = 80   # candidatos da página-alvo enviados ao Jev para contagem
@@ -66,6 +68,8 @@ def load_settings() -> Settings:
         arrive_threshold=_env_float("ARRIVE_THRESHOLD", 0.7),
         max_depth=_env_int("MAX_DEPTH", 4),
         max_pages_per_find=_env_int("MAX_PAGES_PER_FIND", 14),
+        refine_min_gain=_env_float("REFINE_MIN_GAIN", 0.05),
+        refine_retry_drop=_env_float("REFINE_RETRY_DROP", 0.3),
         max_count_candidates=_env_int("MAX_COUNT_CANDIDATES", 80),
         count_text_chars=_env_int("COUNT_TEXT_CHARS", 8000),
         collapse_options_over=_env_int("COLLAPSE_OPTIONS_OVER", 20),
