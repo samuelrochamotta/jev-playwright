@@ -90,6 +90,10 @@ ACTIONS = {
     "BACK": "Beco sem saída: nada nesta página leva ao alvo; voltar e tentar outra alternativa.",
 }
 LOCAL_ACTIONS = {"HOVER"}
+# Links externos que nunca são a consulta do alvo (ver `_external_ok`): portais de outros entes/poderes e redes sociais.
+OTHER_GOV_RE = re.compile(r"\.(gov|jus|mp|leg)\.br$")
+SOCIAL_HOSTS = ("facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com", "youtu.be", "soundcloud.com",
+                "flickr.com", "spotify.com", "linkedin.com", "tiktok.com", "whatsapp.com", "telegram.org", "t.me")
 
 
 @dataclass
@@ -182,28 +186,50 @@ class JevExplorer:
         answers = self.jev.decide(state, questions)
         return {q.id: answers.get(q.id, {}).get("choice", "julgar_pagina") for q in section.questions}
 
-    def _viable(self, e: Element, page: PageState, visited: set[str]) -> bool:
+    def _viable(self, e: Element, page: PageState, visited: set[str], external: bool = False) -> bool:
         """Elemento que ainda pode ser clicado: não repete a página atual, links já visitados, já clicados
-        nem sites externos. Só estes entram na tabela do Jev, para a probabilidade ir a opções úteis."""
+        nem sites externos. Só estes entram na tabela do Jev, para a probabilidade ir a opções úteis.
+        Com `external`, links de outro domínio no CONTEÚDO da página também valem (ver `_refine`)."""
         if e.kind != "click":
             return True
         if e.signature in self._clicked:
             return False
         if e.href and (e.href in visited or e.href.rstrip("/") == page.url.rstrip("/")):
             return False
-        return not e.href or self._same_site(e.href)
+        return not e.href or self._same_site(e.href) or (external and self._external_ok(e))
+
+    def _external_ok(self, e: Element) -> bool:
+        """Link de outro domínio que pode ser a consulta do alvo hospedada fora do site (sistema terceirizado,
+        painel). Ficam de fora, por política: links do cabeçalho/menus/rodapé; a raiz de outro site (é "ir para
+        outro portal", não uma seção); portais de outros entes/poderes (gov.br, jus.br, mp.br, leg.br); redes
+        sociais."""
+        if e.in_nav or not e.href:
+            return False
+        u = urlparse(e.href)
+        host = u.netloc.lower()
+        if not u.path.strip("/") and not u.query:
+            return False
+        if OTHER_GOV_RE.search(host):
+            return False
+        return not any(host == h or host.endswith("." + h) for h in SOCIAL_HOSTS)
 
     def _decide(self, target: str, page: PageState, stack: list[Frame], discarded: list[str],
-                visited: set[str] | None = None) -> dict:
-        shown = [e for e in page.elements if self._viable(e, page, visited or set())]
+                visited: set[str] | None = None, external: bool = False) -> dict:
+        shown = [e for e in page.elements if self._viable(e, page, visited or set(), external)]
         clickable = {str(e.index): e.describe() for e in shown if e.kind == "click"}
         typeable = {str(e.index): e.describe() for e in shown if e.kind == "type"}
+        contexto = ("Estamos navegando num portal público procurando a página/seção descrita em `alvo`. "
+                    "Um link ou card com o nome do alvo NÃO é o alvo: o alvo é a página cujo conteúdo principal "
+                    "(título, listagem, filtros, dados) trata do assunto.")
+        if external:
+            contexto += (" Já estamos na seção do tema; `elementos` inclui links para OUTROS domínios. Procuramos o "
+                         "link/banner que abre a CONSULTA específica do alvo (sistema de consulta, painel, listagem "
+                         "com filtros) do mesmo ente, mesmo hospedada fora do site. Links para o portal de outro "
+                         "ente ou poder (nacional, estadual, tribunal) NÃO são o alvo.")
         state = {
             "alvo": target,
             "pergunta_de_referencia": self._reference,
-            "contexto": "Estamos navegando num portal público procurando a página/seção descrita em `alvo`. "
-                        "Um link ou card com o nome do alvo NÃO é o alvo: o alvo é a página cujo conteúdo principal "
-                        "(título, listagem, filtros, dados) trata do assunto.",
+            "contexto": contexto,
             "pagina_atual": {"url": page.url, "titulo": page.title, "profundidade_em_cliques": len(stack),
                              "conteudo": page.content(self.s.page_text_chars)},
             "caminho_percorrido": [f.step.label() for f in stack],
@@ -264,9 +290,7 @@ class JevExplorer:
                 return False
             if e.href and (e.href in visited or e.href.rstrip("/") == page.url.rstrip("/")):
                 return False
-            if e.href and not self._same_site(e.href):
-                return False
-            return True
+            return not e.href or self._same_site(e.href)
 
         ranked_click = [(by_index[k], p) for k, p in self._rank(ans.get("alvo_clique")) if k in by_index]
         alternatives = [(e.signature, e.describe()[:100], p) for e, p in ranked_click
@@ -489,15 +513,42 @@ class JevExplorer:
                       discarded: list[str], trace: list[str], result: SectionResult) -> tuple[PageState, float]:
         """Já na seção do tema. Se o Jev diz que faltam qualificadores do alvo (ex.: aba 'Federais' numa página
         de emendas em geral), dá até `max_refine_steps` cliques DENTRO da seção, guiado pela cabeça `alvo_clique`,
-        e só aceita cada passo se `exato` subir mantendo o tema. Caso contrário, fica na página do tema."""
+        e só aceita cada passo se `exato` subir mantendo o tema. Caso contrário, fica na página do tema.
+
+        Se a seção não tem sub-alvo interno claro, mas o conteúdo tem links para OUTRO domínio (banner/card para
+        o sistema terceirizado onde a consulta de fato mora, como o municipioonline em Aracaju), o Jev é
+        consultado de novo (1 chamada) com esses links na tabela. Links externos do cabeçalho/menus/rodapé
+        (gov.br, outros órgãos, redes sociais) continuam fora, e nunca entram na busca antes da seção do tema."""
         prob = float(ans.get("chegou", {}).get("noul", 0.0) or 0.0)
         for _ in range(self.s.max_refine_steps):
             exact = float(ans.get("exato", {}).get("noul", 0.0) or 0.0)
             if exact >= self.s.arrive_threshold:
                 break
             by_index = {str(e.index): e for e in page.elements}
-            ranked = [(by_index[k], p) for k, p in self._rank(ans.get("alvo_clique")) if k in by_index]
-            cand = next(((e, p) for e, p in ranked if self._viable(e, page, visited)), None)
+
+            def best(answer: dict, external: bool) -> tuple[Element, float] | None:
+                ranked = [(by_index[k], p) for k, p in self._rank(answer.get("alvo_clique"))
+                          if k in by_index and self._viable(by_index[k], page, visited, external)]
+                if not ranked:
+                    return None
+                el, p = ranked[0]
+                if external and el.href and not self._same_site(el.href):
+                    # vários links para o mesmo sistema externo (um por órgão) dividem a probabilidade entre si:
+                    # a decisão é "ir para aquele sistema", então a massa do host conta para o melhor deles
+                    host = urlparse(el.href).netloc.lower()
+                    p = sum(q for e, q in ranked if e.href and urlparse(e.href).netloc.lower() == host)
+                return el, p
+
+            cand = best(ans, external=False)
+            if cand is None or cand[1] < self.s.refine_min_prob:
+                externals = [e for e in page.elements if e.href and not self._same_site(e.href)
+                             and self._viable(e, page, visited, external=True)]
+                if externals:
+                    ans_ext = self._decide(target, page, stack, discarded, visited, external=True)
+                    cand = best(ans_ext, external=True)
+                    if cand is not None and not self._same_site(cand[0].href):
+                        trace.append(f"· seção do tema sem sub-alvo interno; considerando {len(externals)} link(s) "
+                                     f"externo(s) do conteúdo (melhor: {cand[0].describe()[:60]}, p={cand[1]:.2f})")
             if cand is None or cand[1] < self.s.refine_min_prob:
                 trace.append(f"· seção do tema encontrada (exato={exact:.2f}); sem sub-alvo claro para refinar")
                 break
@@ -513,7 +564,8 @@ class JevExplorer:
                 trace.append(f"· refinamento: clicar em {label} não mudou a página")
                 break
             result.pages_visited += 1
-            ans2 = self._decide(target, new_page, stack, discarded, visited)
+            # já num sistema terceirizado: os links "externos" são os da própria página
+            ans2 = self._decide(target, new_page, stack, discarded, visited, external=not self._same_site(new_page.url))
             prob2 = float(ans2.get("chegou", {}).get("noul", 0.0) or 0.0)
             exact2 = float(ans2.get("exato", {}).get("noul", 0.0) or 0.0)
             self.log(f"    Jev [{len(stack)}+] refinamento {label}: P(tema)={prob2:.2f} P(exato)={exact:.2f}→{exact2:.2f}")
@@ -776,9 +828,11 @@ class JevExplorer:
                 f"itens (um dos que devem entrar na contagem)? Candidatos marcados 'revelado ao abrir X' estavam "
                 f"escondidos num dropdown/menu e só apareceram ao abri-lo. Considere o papel do elemento e o "
                 f"contexto em `pagina.conteudo`; não conte elementos de navegação geral do site, o próprio abridor, "
-                f"nem itens de outro tipo.",
+                f"nem itens de outro tipo (ex.: 'Imprimir' ou 'Pesquisar' não são formatos de exportação; um botão "
+                f"de busca não é um filtro).",
                 {"true": "O candidato é exatamente um dos itens que a pergunta pede para contar.",
-                 "false": "O candidato é outra coisa (navegação, rodapé, abridor, item de outro tipo, texto solto)."})
+                 "false": "O candidato é outra coisa (navegação, rodapé, abridor, ação de outro tipo, item de outro "
+                          "tipo, texto solto)."})
                 for k in keys}
             answers = self.jev.decide(state, qs)
             for k in keys:

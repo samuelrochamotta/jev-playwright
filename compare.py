@@ -1,6 +1,7 @@
 """Roda o mesmo checklist nos dois modos (jev × llm-only) e compara lado a lado.
 
     python compare.py checklists/checklist.md --url URL1 --ente "Ente 1/UF" --url URL2 --ente "Ente 2/UF" --gold checklists/gold.json [--only 1] [--runs 3]
+    python compare.py checklists/checklist.md --entes entes.csv --gold checklists/gold.json
 
 O gabarito (--gold) é um JSON {"<host ou URL>": {"1.1": "sim", "1.2": "2"}} ou, para um só site, {"1.1": ...}.
 As respostas são comparadas como booleano (sim/não) ou inteiro. Com gabarito, imprime a acurácia de cada modo;
@@ -17,7 +18,7 @@ from urllib.parse import urlparse
 from jev_playwright.checklist import load_checklist
 from jev_playwright.config import load_settings
 from jev_playwright.explorer import parse_answer
-from run_checklist import pair_urls_entes, run
+from run_checklist import collect_targets, run
 
 ROWS = [("alvos_encontrados", "Alvos encontrados"), ("tempo_total_s", "Tempo total (s)"), ("paginas", "Páginas visitadas"),
         ("chamadas_llm", "Chamadas ao LLM"), ("tokens_llm", "Tokens do LLM"), ("tempo_llm_s", "Tempo no LLM (s)"),
@@ -54,13 +55,16 @@ async def main() -> None:
     ap.add_argument("checklist")
     ap.add_argument("--url", action="append")
     ap.add_argument("--ente", action="append", help='nome do ente por --url, ex.: "Goiânia/GO"')
+    ap.add_argument("--entes", help="CSV com colunas ente,uf,url (ex.: entes.csv); compara os modos em cada linha")
+    ap.add_argument("--ente-filtro", help="compara só os entes do --entes cujo nome contém um destes termos")
     ap.add_argument("--only", help="números de seções, ex.: 1,3")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--gold")
     args = ap.parse_args()
     settings = load_settings()
     checklist = load_checklist(args.checklist)
-    pairs = pair_urls_entes(args.url or [checklist.url], args.ente)
+    pairs = collect_targets(args.url or ([checklist.url] if not args.entes else None),
+                            args.ente, args.entes, args.ente_filtro)
     urls = [u for u, _ in pairs]
     grand: dict[str, dict] = {"jev": {}, "llm-only": {}}
     hits: dict[str, list[int]] = {"jev": [], "llm-only": []}

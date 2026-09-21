@@ -16,5 +16,17 @@
     "1.2": 2,
     "1.3": "nao",
     "1.4": 2
+  },
+  "https://www.transparencia.salvador.ba.gov.br/#/": {
+    "1.1": "sim",
+    "1.2": 1,
+    "1.3": "sim",
+    "1.4": 2
+  },
+  "https://transparencia.aracaju.se.gov.br/prefeitura/": {
+    "1.1": "sim",
+    "1.2": 2,
+    "1.3": "sim",
+    "1.4": 5
   }
 }

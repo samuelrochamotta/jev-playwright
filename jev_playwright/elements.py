@@ -182,13 +182,17 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
         rest = (m.group("rest") or "").strip()
         value = rest.strip('"') if rest and not rest.endswith(":") else ""
         name = (m.group("name") or "").replace('\\"', '"')
+        indent = len(raw) - len(raw.lstrip())
         if not name and role not in CLICKABLE | TYPEABLE | SELECTABLE and value and len(value) <= 80:
             # `generic [cursor=pointer]: Texto` — filtro/aba/card clicável sem papel ARIA: o texto é o nome
             name, value = value, ""
+        if not name and role in CLICKABLE:
+            # link/botão sem nome ARIA cujo filho é uma imagem ou texto (`- img "emendas banner 2026"`):
+            # o texto do filho é o nome, senão o Jev vê só "link · url: ..."
+            name = _child_text(lines, i, indent)
         context = " | ".join(recent_text) if name.lower() in GENERIC_NAMES or not name else ""
         el = Element(index=len(elements) + 1, ref=ref.group(1), role=role, name=name, value=value,
                      attrs=attrs, context=context, in_nav=nav_of.get(i, False))
-        indent = len(raw) - len(raw.lstrip())
         if name and (normalize(name) in GENERIC_NAMES or counts.get(f"{role}|{normalize(name)}", 0) > 1):
             detail = _child_text(lines, i, indent)
             if detail and normalize(detail) != normalize(name):

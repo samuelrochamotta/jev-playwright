@@ -2,6 +2,8 @@
 
     python run_checklist.py checklists/checklist.md --url https://transparencia.pbh.gov.br/ --ente "Belo Horizonte/MG"
     python run_checklist.py checklists/checklist.md --url URL1 --ente "Ente 1/UF" --url URL2 --ente "Ente 2/UF" --mode llm-only
+    python run_checklist.py checklists/checklist.md --entes entes.csv            # lista de entes (ente,uf,url)
+    python run_checklist.py checklists/checklist.md --entes entes.csv --ente-filtro Salvador
     python run_checklist.py checklists/checklist.md --url URL --headed --only 1
 
 Cada execução é gravada em `<out>/<Nome do ente-UF>/execucao_<AAAAMMDDhhmmss>/report-<modo>.{md,json}`.
@@ -16,6 +18,7 @@ import time
 from jev_playwright.browser import Browser
 from jev_playwright.checklist import load_checklist
 from jev_playwright.config import Settings, load_settings
+from jev_playwright.entes import filter_entes, load_entes
 from jev_playwright.explorer import JevExplorer, SectionResult
 from jev_playwright.jev_client import JevClient
 from jev_playwright.llm_client import OpenRouterChat
@@ -80,12 +83,27 @@ def pair_urls_entes(urls: list[str] | None, entes: list[str] | None) -> list[tup
     return [(u, entes[i] if i < len(entes) else None) for i, u in enumerate(urls)]
 
 
+def collect_targets(urls: list[str] | None, entes: list[str] | None, entes_csv: str | None = None,
+                    ente_filtro: str | None = None) -> list[tuple[str | None, str | None]]:
+    """Alvos a avaliar: os do CSV (--entes) mais os pares --url/--ente da linha de comando."""
+    pairs: list[tuple[str | None, str | None]] = []
+    if entes_csv:
+        pairs += filter_entes(load_entes(entes_csv), ente_filtro)
+    elif ente_filtro:
+        raise SystemExit("--ente-filtro só faz sentido junto de --entes")
+    if urls or entes or not pairs:
+        pairs += pair_urls_entes(urls, entes)
+    return pairs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Executa um checklist de perguntas (sim/não ou número) contra portais.")
     ap.add_argument("checklist")
     ap.add_argument("--mode", choices=["jev", "llm-only"], default="jev")
     ap.add_argument("--url", action="append", help="site(s) a avaliar; sobrepõe a linha URL: do checklist")
     ap.add_argument("--ente", action="append", help='nome do ente por --url, ex.: "Goiânia/GO"; nomeia a pasta de resultados')
+    ap.add_argument("--entes", help="CSV com colunas ente,uf,url (ex.: entes.csv); roda o checklist em cada linha")
+    ap.add_argument("--ente-filtro", help="roda só os entes do --entes cujo nome contém um destes termos, ex.: Salvador,Aracaju")
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--only", help="números de seções, ex.: 1,3")
     ap.add_argument("--out", default="reports")
@@ -93,10 +111,23 @@ def main() -> int:
     settings = load_settings()
     if args.headed:
         settings = Settings(**{**settings.__dict__, "headless": False})
-    ok = True
-    for url, ente in pair_urls_entes(args.url, args.ente):
-        summary = asyncio.run(run(args.checklist, args.mode, settings, args.only, args.out, url, ente))
+    targets = collect_targets(args.url, args.ente, args.entes, args.ente_filtro)
+    ok, falhas = True, []
+    for i, (url, ente) in enumerate(targets, 1):
+        if len(targets) > 1:
+            print(f"\n>>> [{i}/{len(targets)}] {ente or url}")
+        try:
+            summary = asyncio.run(run(args.checklist, args.mode, settings, args.only, args.out, url, ente))
+        except Exception as exc:  # um ente que falha não interrompe o lote
+            if len(targets) == 1:
+                raise
+            print(f"!!! {ente or url}: {type(exc).__name__}: {exc}")
+            ok = False
+            falhas.append(ente or url)
+            continue
         ok = ok and summary["erros"] == 0
+    if falhas:
+        print(f"\nEntes com falha: {', '.join(falhas)}")
     return 0 if ok else 1
 
 
