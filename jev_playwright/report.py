@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -25,10 +26,29 @@ def ente_dirname(ente: str | None, url: str) -> str:
     return re.sub(r"\s+", " ", name).strip(" .")[:80] or host_slug(url)
 
 
+def _dir_key(name: str) -> str:
+    """Chave de comparação de pastas: sem acentos, sem diferença de caixa/espaços (`Goiânia-GO` == `Goiania-GO`)."""
+    decomposed = unicodedata.normalize("NFD", name)
+    plain = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", plain).strip().casefold()
+
+
+def resolve_ente_dir(out_dir: str | Path, ente: str | None, url: str) -> Path:
+    """Pasta do ente em `out_dir`: reaproveita a já existente (mesmo nome, ignorando acentos e caixa) ou devolve a nova."""
+    out_dir = Path(out_dir)
+    name = ente_dirname(ente, url)
+    if out_dir.is_dir():
+        key = _dir_key(name)
+        for existing in sorted(out_dir.iterdir()):
+            if existing.is_dir() and _dir_key(existing.name) == key:
+                return existing
+    return out_dir / name
+
+
 def execution_dir(out_dir: str | Path, ente: str | None, url: str, when: datetime | None = None) -> Path:
-    """`<out_dir>/<ente>/execucao_<AAAAMMDDhhmmss>` — cria a pasta do ente na primeira execução."""
+    """`<out_dir>/<ente>/execucao_<AAAAMMDDhhmmss>` — cria a pasta do ente só se ainda não existir uma equivalente."""
     when = when or datetime.now()
-    path = Path(out_dir) / ente_dirname(ente, url) / f"execucao_{when:%Y%m%d%H%M%S}"
+    path = resolve_ente_dir(out_dir, ente, url) / f"execucao_{when:%Y%m%d%H%M%S}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
