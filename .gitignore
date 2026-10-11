@@ -5,3 +5,6 @@ reports/**/*.md
 __pycache__/
 
 .claude/*
+.jev-recipes/
+reports/**/artifacts/
+.venv/

@@ -29,10 +29,15 @@ def load_gold(path: str | None, url: str) -> dict[str, str]:
     if not path:
         return {}
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    host = urlparse(url).netloc
-    for key in (url, host, url.rstrip("/")):
-        if key in data:
-            return {k: str(v) for k, v in data[key].items()}
+    def identity(value: str) -> tuple[str, str]:
+        parsed = urlparse(value if "://" in value else "https://" + value)
+        return ((parsed.hostname or "").lower().removeprefix("www."), parsed.path.rstrip("/"))
+    host, path_part = identity(url)
+    exact = next((value for key, value in data.items() if isinstance(value, dict) and identity(key) == (host, path_part)), None)
+    host_only = next((value for key, value in data.items() if isinstance(value, dict) and identity(key) == (host, "")), None)
+    matched = exact if exact is not None else host_only
+    if matched is not None:
+        return {k: str(v) for k, v in matched.items()}
     if all(not isinstance(v, dict) for v in data.values()):
         return {k: str(v) for k, v in data.items()}
     return {}
@@ -61,6 +66,8 @@ async def main() -> None:
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--gold")
     args = ap.parse_args()
+    if args.runs < 1:
+        ap.error("--runs deve ser >= 1")
     settings = load_settings()
     checklist = load_checklist(args.checklist)
     pairs = collect_targets(args.url or ([checklist.url] if not args.entes else None),
@@ -73,10 +80,16 @@ async def main() -> None:
     for url, ente in pairs:
         totals: dict[str, dict] = {}
         answers: dict[str, dict] = {}
+        gold = load_gold(args.gold, url)
+        run_answers: dict[str, list[dict]] = {"jev": [], "llm-only": []}
         for mode in ("jev", "llm-only"):
             acc: dict = {}
             for _ in range(args.runs):
                 s = await run(args.checklist, mode, settings, args.only, "reports", url, ente)
+                run_answers[mode].append(s["respostas"])
+                for qid, answer in s["respostas"].items():
+                    if qid in gold:
+                        hits[mode].append(int(same(answer["resposta"], gold[qid])))
                 for k, v in s.items():
                     if isinstance(v, (int, float)):
                         acc[k] = acc.get(k, 0) + v
@@ -85,7 +98,9 @@ async def main() -> None:
             for k, v in totals[mode].items():
                 grand[mode][k] = grand[mode].get(k, 0) + v
 
-        gold = load_gold(args.gold, url)
+        for left, right in zip(run_answers["jev"], run_answers["llm-only"]):
+            for qid in set(left) | set(right):
+                agree.append(int(same(left.get(qid, {}).get("resposta"), right.get(qid, {}).get("resposta"))))
         print(f"\n{'='*78}\nCOMPARAÇÃO — {url}  (média de {args.runs} execução(ões); LLM = {settings.llm_model})\n")
         print(f"{'Métrica':<28}{'jev':>16}{'llm-only':>18}")
         print("-" * 62)
@@ -97,17 +112,15 @@ async def main() -> None:
         print("-" * 62)
         print(f"{'Custo total (US$)':<28}{cj:>16.5f}{cl:>18.5f}")
 
+        print("\nRespostas abaixo: última execução; acurácia/concordância: todas as execuções.")
         print(f"\n{'ID':<6}{'jev':<28}{'llm-only':<28}{'gabarito':<16}")
         print("-" * 78)
         for qid in answers["jev"]:
             a = answers["jev"][qid]["resposta"]
             b = answers["llm-only"].get(qid, {}).get("resposta", "-")
             g = gold.get(qid, "")
-            agree.append(int(same(a, b)))
             marks = ""
             if g:
-                hits["jev"].append(int(same(a, g)))
-                hits["llm-only"].append(int(same(b, g)))
                 marks = f"{'✓' if same(a, g) else '✗'} jev  {'✓' if same(b, g) else '✗'} llm"
             print(f"{qid:<6}{str(a)[:26]:<28}{str(b)[:26]:<28}{g[:14]:<16}{marks}")
 

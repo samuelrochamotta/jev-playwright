@@ -32,13 +32,16 @@ class OpenRouterChat:
         resp = self._http.post("/api/v1/chat/completions", json=body)
         self.total_ms += int((time.perf_counter() - t0) * 1000)
         if resp.status_code >= 400:
-            raise RuntimeError(f"LLM HTTP {resp.status_code}: {resp.text[:500]}")
+            raise RuntimeError(f"LLM HTTP {resp.status_code}")
         data = resp.json()
         usage = data.get("usage") or {}
         self.total_calls += 1
         self.total_cost += float(usage.get("cost") or 0.0)
         self.total_tokens += int(usage.get("total_tokens") or 0)
         return data["choices"][0]["message"]
+
+    def close(self) -> None:
+        self._http.close()
 
     def stats(self) -> dict:
         return {"chamadas": self.total_calls, "custo_usd": round(self.total_cost, 5),

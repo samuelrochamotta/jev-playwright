@@ -53,6 +53,40 @@ class Settings:
     wait_loading_rounds: int = 4     # esperas extras enquanto o snapshot tem placeholders de carga
     # --- baseline llm-only ---
     llm_explore_turns: int = 25      # turnos do LLM por seção
+    search_strategy: str = "best-first"  # dfs remains available as baseline
+    candidate_limit: int = 24
+    frontier_limit: int = 100
+    max_action_errors: int = 3
+    require_exact: bool = True
+    uncertainty_margin: float = 0.1  # abstain on binary/count candidate probabilities near 0.5
+    objective: str = "audit"        # audit | collect
+    collect: bool = False
+    max_sources: int = 8
+    max_download_bytes: int = 10_000_000
+    max_records: int = 1000
+    recipe_dir: str = ".jev-recipes"
+    use_recipes: bool = False
+    fallback: bool = False          # bounded, validated generative proposal
+    fallback_attempts: int = 1
+    fallback_vision: bool = False   # opt-in screenshot as context; executable actions remain bounded
+
+    def __post_init__(self) -> None:
+        if self.search_strategy not in {"best-first", "dfs"} or self.objective not in {"audit", "collect"}:
+            raise ValueError("Estratégia/objetivo inválido")
+        for name in ("max_elements", "max_pages_per_find", "candidate_limit", "frontier_limit", "max_action_errors",
+                     "max_sources", "max_download_bytes", "max_records", "fallback_attempts", "max_alternatives", "count_batch"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} deve ser positivo")
+        if self.max_depth < 0:
+            raise ValueError("max_depth não pode ser negativo")
+        if not 0 <= self.uncertainty_margin < 0.5:
+            raise ValueError("uncertainty_margin deve estar entre 0 e 0.5 (exclusivo)")
+        if not 0 <= self.arrive_threshold <= 1:
+            raise ValueError("arrive_threshold deve estar entre 0 e 1")
+        if self.fallback_vision and not self.fallback:
+            raise ValueError("Visão exige fallback habilitado")
+        if self.collect and self.objective != "collect":
+            raise ValueError("Coleta exige objective=collect")
 
 
 def load_settings() -> Settings:
@@ -80,4 +114,12 @@ def load_settings() -> Settings:
         max_scroll_rounds=_env_int("MAX_SCROLL_ROUNDS", 4),
         wait_loading_rounds=_env_int("WAIT_LOADING_ROUNDS", 4),
         llm_explore_turns=_env_int("LLM_EXPLORE_TURNS", 25),
+        search_strategy=os.environ.get("SEARCH_STRATEGY", "best-first"),
+        candidate_limit=_env_int("CANDIDATE_LIMIT", 24),
+        frontier_limit=_env_int("FRONTIER_LIMIT", 100),
+        max_action_errors=_env_int("MAX_ACTION_ERRORS", 3),
+        max_sources=_env_int("MAX_SOURCES", 8),
+        max_download_bytes=_env_int("MAX_DOWNLOAD_BYTES", 10_000_000),
+        max_records=_env_int("MAX_RECORDS", 1000),
+        recipe_dir=os.environ.get("RECIPE_DIR", ".jev-recipes"),
     )

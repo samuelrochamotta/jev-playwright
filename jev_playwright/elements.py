@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urldefrag
+from urllib.parse import urldefrag, urljoin
 
 LINE_RE = re.compile(
     r"""^\s*-\s+(?P<role>[a-zA-Z]+)(?:\s+"(?P<name>(?:[^"\\]|\\.)*)")?(?P<attrs>(?:\s+\[[^\]]*\])*)\s*:?\s*(?P<rest>.*)$"""
@@ -135,6 +135,8 @@ class Element:
     href: str = ""
     detail: str = ""      # texto do filho, usado quando o nome ARIA é genérico ou repetido na página
     in_nav: bool = False  # dentro de banner/navigation/contentinfo
+    scope: str = ""       # semantic ancestors distinguish identical controls in different regions
+    frame: str = ""       # frame prefix, never an element ref
 
     @property
     def kind(self) -> str:
@@ -148,7 +150,8 @@ class Element:
     def signature(self) -> str:
         """Identidade estável entre snapshots (os refs mudam a cada snapshot). O `detail` entra quando
         o nome sozinho não distingue o elemento (dois links "Clique para exportar" → xlsx e csv)."""
-        s = f"{self.role}|{normalize(self.name)}|{self.href}"
+        # MCP frame IDs change after navigation, including the main frame. Logical ancestry is stable.
+        s = f"{self.scope}|{self.role}|{normalize(self.name)}|{self.href}"
         return f"{s}|{normalize(self.detail)}" if self.detail else s
 
     def describe(self) -> str:
@@ -184,10 +187,22 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
             k = f"{m.group('role')}|{normalize(m.group('name'))}"
             counts[k] = counts.get(k, 0) + 1
     recent_text: list[str] = []
+    ancestors: list[tuple[int, str]] = []
+    iframe_counts: dict[str, int] = {}
     for i, raw in enumerate(lines):
         m = LINE_RE.match(raw)
         if not m:
             continue
+        indent = len(raw) - len(raw.lstrip())
+        while ancestors and ancestors[-1][0] >= indent:
+            ancestors.pop()
+        scope = "/".join(label for _, label in ancestors if label)
+        label = f"{m.group('role')}:{normalize(m.group('name') or '')}" if m.group('name') else ""
+        if m.group('role') == 'iframe':
+            key = scope + '/' + (label or 'iframe')
+            iframe_counts[key] = iframe_counts.get(key, 0) + 1
+            label = f"{label or 'iframe'}[{iframe_counts[key]}]"
+        ancestors.append((indent, label))
         attrs = m.group("attrs") or ""
         ref = REF_RE.search(attrs)
         rest_text = (m.group("rest") or "").strip().strip('"')
@@ -218,7 +233,8 @@ def parse_snapshot(text: str, max_elements: int = 600, base_url: str = "") -> li
             name = _child_text(lines, i, indent)
         context = " | ".join(recent_text) if name.lower() in GENERIC_NAMES or not name else ""
         el = Element(index=len(elements) + 1, ref=ref.group(1), role=role, name=name, value=value,
-                     attrs=attrs, context=context, in_nav=nav_of.get(i, False))
+                     attrs=attrs, context=context, in_nav=nav_of.get(i, False), scope=scope,
+                     frame=(re.match(r"f\d+", ref.group(1)).group(0) if re.match(r"f\d+", ref.group(1)) else ""))
         if name and (normalize(name) in GENERIC_NAMES or counts.get(f"{role}|{normalize(name)}", 0) > 1):
             detail = _child_text(lines, i, indent)
             if detail and normalize(detail) != normalize(name):
@@ -461,3 +477,30 @@ def opener_candidates(elements: list[Element], page_url: str, keywords: list[str
         return any(k in blob for k in keywords)
     out = [e for e in out if hit(e)] + [e for e in out if not hit(e)]
     return out[:max_openers]
+
+
+def focused_content(snapshot: str, keywords: list[str], limit: int) -> str:
+    """Retrieve nearby relevant blocks before truncating; keywords never decide the answer."""
+    text = content_text(snapshot, 200_000)
+    if len(text) <= limit:
+        return text
+    lines = text.splitlines()
+    def relevance(index: int) -> int:
+        line = normalize(lines[index])
+        return sum(word in line for word in keywords) + int('heading' in line)
+    selected: set[int] = set()
+    used = 0
+    # Keep initial context, then windows around strongest hits; retain document order in the output.
+    for center in list(range(min(3, len(lines)))) + sorted(range(len(lines)), key=relevance, reverse=True):
+        for index in range(max(0, center - 1), min(len(lines), center + 2)):
+            if index not in selected and used + len(lines[index]) + 1 < limit - 80:
+                selected.add(index)
+                used += len(lines[index]) + 1
+    result = []
+    previous = -1
+    for index in sorted(selected):
+        if index > previous + 1:
+            result.append('…(blocos omitidos)')
+        result.append(lines[index])
+        previous = index
+    return ('\n'.join(result)[:max(0, limit - 45)] + '\n…(trechos recuperados; conteúdo parcial)')[:limit]

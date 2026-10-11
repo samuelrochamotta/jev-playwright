@@ -8,7 +8,15 @@ from dataclasses import dataclass, field
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from .elements import LOADING_RE, Element, consent_button, content_text, page_text, parse_snapshot, prioritize
+from .elements import (
+    LOADING_RE,
+    Element,
+    consent_button,
+    content_text,
+    page_text,
+    parse_snapshot,
+    prioritize,
+)
 
 SNAP_RE = re.compile(r"```yaml\n(.*?)```", re.S)
 URL_RE = re.compile(r"- Page URL: (.*)")
@@ -19,7 +27,8 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML
 CHALLENGE_RE = re.compile(r"captcha|visitante leg[ií]timo|digite o c[oó]digo que aparece|verify you are (a )?human|"
                           r"n[aã]o sou um rob[oô]|access denied|acesso negado|request blocked|attention required", re.I)
 ACTIVE_RE = re.compile(r"\s*\[active\]")  # marcador de foco: muda a cada clique sem mudar a página
-DOC_EXT = (".pdf", ".xls", ".xlsx", ".csv", ".ods", ".doc", ".docx", ".zip")
+DOC_EXT = (".pdf", ".xls", ".xlsx", ".csv", ".ods", ".json", ".doc", ".docx", ".zip")
+MCP_VERSION = "0.0.83"
 
 
 @dataclass
@@ -44,9 +53,18 @@ class PageState:
         return hashlib.sha1((self.url + "\n" + ACTIVE_RE.sub("", self.snapshot)).encode()).hexdigest()[:12]
 
     @property
+    def semantic_hash(self) -> str:
+        """State identity without ephemeral refs/focus; includes route, filters and frame context."""
+        snap = re.sub(r"\[ref=[A-Za-z0-9_]+\]", "", ACTIVE_RE.sub("", self.snapshot))
+        snap = re.sub(r"\b\d{1,2}:\d{2}:\d{2}\b", "<clock>", snap)
+        snap = re.sub(r"[ \t]+", " ", snap)
+        return hashlib.sha256((self.url + "\n" + snap).encode()).hexdigest()[:20]
+
+    @property
     def is_challenge(self) -> bool:
         """Página de desafio anti-robô (captcha/WAF): a exploração não pode prosseguir por aqui."""
-        return bool(CHALLENGE_RE.search(self.snapshot)) and len(self.elements) < 12
+        explicit = re.search(r"captcha|verify you are (a )?human|visitante leg[ií]timo|digite o c[oó]digo que aparece|n[aã]o sou um rob[oô]", self.snapshot, re.I)
+        return bool(explicit) or (bool(CHALLENGE_RE.search(self.snapshot)) and len(self.elements) < 12)
 
     @property
     def loading(self) -> int:
@@ -69,7 +87,7 @@ class Browser:
     def __init__(self, headless: bool = True, max_elements: int = 120) -> None:
         # --isolated: perfil novo a cada execução. Sem isso o MCP reutiliza um perfil persistente
         # e estado antigo (cookies/localStorage) pode fazer o site ignorar cliques.
-        args = ["-y", "@playwright/mcp@latest", "--browser", "chrome", "--isolated",
+        args = ["-y", f"@playwright/mcp@{MCP_VERSION}", "--browser", "chrome", "--isolated",
                 "--user-agent", UA, "--ignore-https-errors", "--timeout-action", "15000"]
         if headless:
             args.append("--headless")
@@ -165,7 +183,7 @@ class Browser:
     async def scroll_into_view(self, el: Element) -> None:
         """Rola o contêiner até o elemento (listas virtualizadas só renderizam o que está visível)."""
         await self.call("browser_evaluate", function="(el) => el.scrollIntoView({block: 'end'})",
-                        element=el.describe()[:120], ref=el.ref)
+                        element=el.describe()[:120], target=el.ref)
 
     async def back(self) -> None:
         await self.call("browser_navigate_back")
@@ -175,6 +193,64 @@ class Browser:
 
     async def screenshot(self, filename: str) -> None:
         await self.call("browser_take_screenshot", filename=filename)
+
+    async def screenshot_data(self) -> str:
+        """Opt-in multimodal context. Never interpreted as proof of successful collection."""
+        assert self._session
+        response = await self._session.call_tool("browser_take_screenshot", {"type": "png"})
+        for content in response.content:
+            if getattr(content, "type", None) == "image":
+                mime = getattr(content, "mime_type", None) or getattr(content, "mimeType", "image/png")
+                if len(content.data) > 8_000_000:
+                    raise RuntimeError("Screenshot excede limite do fallback visual")
+                return f"data:{mime};base64,{content.data}"
+        raise RuntimeError("MCP não retornou imagem para fallback visual")
+
+    async def evaluate_json(self, function: str, element: Element | None = None):
+        """Read-only observations. Tool text is transport, not a JSON API contract."""
+        import json
+        args = {"element": element.describe()[:120], "target": element.ref} if element else {}
+        text = await self.call("browser_evaluate", function=function, **args)
+        # MCP returns a Result section followed by code/snapshot metadata.
+        result = text.split("### Result", 1)[-1].split("###", 1)[0].strip()
+        result = re.sub(r"^```(?:json)?\s*|\s*```$", "", result).strip()
+        try:
+            value = json.loads(result)
+            return json.loads(value) if isinstance(value, str) else value
+        except (ValueError, TypeError):
+            raise RuntimeError("browser_evaluate não retornou JSON válido") from None
+
+    async def tables(self, limit: int = 1000) -> list[dict]:
+        page = await self.state()
+        frames: dict[str, Element | None] = {"main": None}
+        for element in page.elements:
+            if 'iframe' in element.scope:
+                logical_frame = '/'.join(part for part in element.scope.split('/') if part.startswith('iframe'))
+                frames.setdefault(logical_frame, element)
+        result = []
+        body = ("Array.from(doc.querySelectorAll('table')).slice(0,20).map((t,index) => ({"
+                "index, rows:Array.from(t.rows).slice(0," + str(limit + 2) + ").map(r => "
+                "Array.from(r.cells).slice(0,100).map(c => c.innerText.trim().slice(0,2000))),"
+                "truncated:t.rows.length>" + str(limit + 1) + "}))")
+        for frame, element in frames.items():
+            function = ("(el) => { const doc=el.ownerDocument; return " if element else
+                        "() => { const doc=document; return ") + body + "; }"
+            try:
+                tables = await self.evaluate_json(function, element)
+                for table in tables:
+                    table["index"] = f"{frame}:{table['index']}"
+                result.extend(tables)
+            except RuntimeError:
+                result.append({"index": frame, "rows": [], "truncated": True, "warning": "Frame não observado"})
+        return result
+
+    async def network_sources(self) -> list[str]:
+        """Observe GET URLs only; never export headers, credentials or request bodies."""
+        try:
+            text = await self.call("browser_network_requests")
+        except RuntimeError:
+            return []
+        return list(dict.fromkeys(re.findall(r"\bGET\s+(https?://[^\s\]<>]+)", text)))
 
     # ---- abas ---------------------------------------------------------------------------
 

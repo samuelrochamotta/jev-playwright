@@ -29,7 +29,8 @@ SYSTEM = (
     "(botão 'Menu', hover). Um link ou card com o nome do alvo NÃO é o alvo: o alvo é a página cujo conteúdo "
     "principal trata do assunto. Explore com parcimônia e desista quando esgotar as opções plausíveis.\n"
     "TODA pergunta admite apenas dois formatos de resposta: a palavra `sim` ou `não` (perguntas de existência / "
-    "característica) ou um NÚMERO INTEIRO (perguntas de 'quantos'). Nunca responda com texto livre.\n"
+    "característica) ou um NÚMERO INTEIRO (perguntas de 'quantos'). Se não encontrou ou não verificou, "
+    "responda null: busca inconclusiva NÃO significa não/zero. Nunca contorne bloqueios anti-robô.\n"
     "Quando tiver as respostas (ou o orçamento acabar), responda SEM chamar ferramentas, apenas com JSON:\n"
     "{\"encontrado\": true|false, \"url_alvo\": \"...\", \"cliques\": <número de cliques do caminho MAIS CURTO da "
     "página inicial até o alvo, sem contar hovers>, \"caminho\": [\"clicar em ...\", ...], "
@@ -98,6 +99,11 @@ class LlmExplorer:
                                                     f"PÁGINA INICIAL ({self.start_url}):\n{page.summary(7000)}"}]
             data: dict = {}
             for turn in range(self.s.llm_explore_turns + 1):
+                if (await self.browser.state()).is_challenge:
+                    result.blocked += 1
+                    result.trace.append("· bloqueio anti-robô; baseline interrompido sem nova inferência")
+                    data = {}
+                    break
                 final = turn == self.s.llm_explore_turns
                 if final:
                     messages.append({"role": "user", "content": "Orçamento esgotado. Responda agora SÓ com o JSON final."})
@@ -117,6 +123,8 @@ class LlmExplorer:
                         continue
                     break
                 for call in calls:
+                    if (await self.browser.state()).is_challenge:
+                        break
                     name = call["function"]["name"]
                     try:
                         args = json.loads(call["function"]["arguments"] or "{}")
@@ -125,6 +133,8 @@ class LlmExplorer:
                     self.log(f"    LLM: {name} {json.dumps(args, ensure_ascii=False)[:110]} ({ms} ms)")
                     result.trace.append(f"{name} {json.dumps(args, ensure_ascii=False)[:160]}")
                     try:
+                        if name not in ALLOWED_TOOLS:
+                            raise ValueError("Ferramenta fora da allowlist")
                         out = await self.browser.call(name, **args)
                         if name in ACTION_TOOLS:
                             await self.browser.wait(0.5)
@@ -135,7 +145,10 @@ class LlmExplorer:
                     if name in ("browser_click", "browser_navigate", "browser_type"):
                         result.pages_visited += 1
                     messages.append({"role": "tool", "tool_call_id": call["id"], "content": out[:14000]})
-            result.found = bool(data.get("encontrado"))
+            result.found = data.get("encontrado") is True
+            result.status = "encontrado_declarado" if result.found else ("bloqueado" if result.blocked else "busca_inconclusiva")
+            result.stop_reason = "declaracao_llm_nao_verificada" if result.found else ("bloqueio_anti_robo" if result.blocked else "baseline_inconclusivo")
+            result.coverage["verified_by_code"] = False
             result.final_url = str(data.get("url_alvo", "") or "")
             result.path = [str(p) for p in (data.get("caminho") or [])]
             clicks = parse_answer(data.get("cliques"))
@@ -144,15 +157,16 @@ class LlmExplorer:
             for q in section.questions:
                 a = answers.get(q.id) or {}
                 raw = a.get("resposta")
-                answer = format_answer(parse_answer(raw))  # só sim / não / inteiro / indeterminado
+                answer = format_answer(parse_answer(raw)) if result.found else "indeterminado"
                 result.questions.append(QuestionResult(
-                    q.id, q.text, "llm", answer, float(a.get("confianca", 0.0) or 0.0),
+                    q.id, q.text, "llm", answer, float(a.get("confianca", 0.0) or 0.0) if result.found else 0.0,
                     str(a.get("evidencia", ""))[:300], source="llm"))
                 extra = f"  (bruto: {str(raw)[:40]!r})" if answer == "indeterminado" and raw not in (None, "") else ""
                 self.log(f"    {q.id} → {answer}  (conf {result.questions[-1].confidence:.2f}){extra}")
             result.found_prob = max((r.confidence for r in result.questions), default=0.0)
         except Exception as exc:  # noqa: BLE001
             result.error = str(exc)
+            result.status, result.stop_reason = "erro", "excecao"
             self.log(f"    ERRO: {exc}")
             for q in section.questions:
                 if not any(r.id == q.id for r in result.questions):

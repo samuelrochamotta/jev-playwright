@@ -48,15 +48,24 @@ def resolve_ente_dir(out_dir: str | Path, ente: str | None, url: str) -> Path:
 def execution_dir(out_dir: str | Path, ente: str | None, url: str, when: datetime | None = None) -> Path:
     """`<out_dir>/<ente>/execucao_<AAAAMMDDhhmmss>` — cria a pasta do ente só se ainda não existir uma equivalente."""
     when = when or datetime.now()
-    path = resolve_ente_dir(out_dir, ente, url) / f"execucao_{when:%Y%m%d%H%M%S}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    parent = resolve_ente_dir(out_dir, ente, url)
+    parent.mkdir(parents=True, exist_ok=True)
+    base = f"execucao_{when:%Y%m%d%H%M%S}"
+    for attempt in range(1000):
+        path = parent / (base if attempt == 0 else f"{base}-{attempt}")
+        try:
+            path.mkdir()
+            return path
+        except FileExistsError:
+            continue
+    raise RuntimeError("Não foi possível reservar diretório único para a execução")
 
 
 def write_reports(title: str, url: str, sections: list[SectionResult], out_dir: str | Path, extra: dict,
-                  mode: str = "jev", ente: str | None = None) -> tuple[Path, Path]:
+                  mode: str = "jev", ente: str | None = None, output: Path | None = None) -> tuple[Path, Path]:
     now = datetime.now()
-    out = execution_dir(out_dir, ente, url, now)
+    out = output or execution_dir(out_dir, ente, url, now)
+    out.mkdir(parents=True, exist_ok=True)
     base = f"report-{mode}"
     json_path, md_path = out / f"{base}.json", out / f"{base}.md"
 
@@ -84,14 +93,27 @@ def write_reports(title: str, url: str, sections: list[SectionResult], out_dir: 
     lines += ["", "## Seções", "", "| # | Seção | Alvo encontrado | P | Cliques | Páginas | Jev | LLM | Tempo (s) | URL final |",
               "|---|---|---|---|---|---|---|---|---|---|"]
     for s in sections:
-        found = "✅ sim" if s.found else "❌ não"
+        found = "✅ encontrado" if s.found else s.status
         clicks = "-" if s.clicks is None else str(s.clicks)
         lines.append(f"| {s.number} | {s.title} | {found} | {s.found_prob:.2f} | {clicks} | {s.pages_visited} | "
                      f"{s.jev_calls} | {s.llm_calls} | {s.elapsed_s} | {s.final_url} |")
     for s in sections:
         lines += ["", f"### Seção {s.number}. {s.title}", ""]
+        lines += [f"- Status: **{s.status}**", f"- Motivo de parada: {s.stop_reason or '-'}",
+                  f"- Qualificadores P(exato): {s.exact_prob:.2f}",
+                  f"- Cobertura: `{json.dumps(s.coverage, ensure_ascii=False)}`", ""]
+        if s.collection:
+            lines += ["Coleta (não implica cobertura completa):", "",
+                      f"- Status: {s.collection.get('status', '-')}",
+                      f"- Registros: {s.collection.get('records', 0)}",
+                      f"- Trechos: {s.collection.get('passages', 0)}",
+                      f"- Manifesto: {s.collection.get('manifest', '-')}", ""]
+        if s.sources:
+            lines += ["Fontes descobertas (não necessariamente confirmadas/coletadas):", ""]
+            lines += [f"- {source['kind']}: {source['url']} ({source.get('status', 'discovered')})" for source in s.sources]
+            lines.append("")
         if s.path:
-            lines += ["Caminho mais curto encontrado:", ""] + [f"{i}. {p}" for i, p in enumerate(s.path, 1)] + [""]
+            lines += ["Caminho encontrado (mínimo global não comprovado):", ""] + [f"{i}. {p}" for i, p in enumerate(s.path, 1)] + [""]
         if s.trace:
             lines += ["Rastro da exploração:", ""] + [f"- {t}" for t in s.trace]
         if s.error:
